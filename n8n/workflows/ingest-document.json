@@ -1,0 +1,144 @@
+{
+  "name": "RAG - Ingest Document",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b1e6a4c0-0001-4a2e-9f2d-000000000001",
+      "name": "Ingest Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "rag-ingest"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://extraction-service:8000/v1/extract/url",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ document_id: $json.body.document_id, url: $json.body.url, engine: $json.body.engine || 'auto', render: $json.body.render === true }) }}",
+        "options": {
+          "timeout": 90000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "b1e6a4c0-0001-4a2e-9f2d-000000000002",
+      "name": "Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_AFTER_IMPORT",
+          "name": "RAG Service JWT"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://chunking-service:8000/v1/index",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ document_id: $json.document_id, text: $json.content, title: $json.title, source: $json.source, source_url: $json.source_url, tenant_id: $('Ingest Webhook').item.json.body.tenant_id || 'default', metadata: { engine: $json.engine, language: $json.language, word_count: $json.word_count }, contextualize: $('Ingest Webhook').item.json.body.contextualize !== false }) }}",
+        "options": {
+          "timeout": 600000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "b1e6a4c0-0001-4a2e-9f2d-000000000003",
+      "name": "Chunk + Index",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_AFTER_IMPORT",
+          "name": "RAG Service JWT"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'indexed', document_id: $json.document_id, collection: $json.collection, chunks_indexed: $json.chunks_indexed, cache: $json.cache, warnings: $json.warnings }) }}",
+        "options": {}
+      },
+      "id": "b1e6a4c0-0001-4a2e-9f2d-000000000004",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Ingest Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract": {
+      "main": [
+        [
+          {
+            "node": "Chunk + Index",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk + Index": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true
+  },
+  "active": false
+}

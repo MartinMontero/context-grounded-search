@@ -1,0 +1,7 @@
+# CI pass/fail gates for `make eval` (mean score over the fixture dataset).
+# A metric below its threshold fails the evaluation job.
+thresholds:
+  context_precision: 0.70
+  context_recall: 0.70
+  faithfulness: 0.80
+  answer_relevancy: 0.75

@@ -1,0 +1,21 @@
+{
+  "name": "defuddle-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JWT-protected Defuddle + Playwright sidecar with Shadow-DOM flattening and SSRF protection",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "defuddle": "0.19.3",
+    "express": "5.2.1",
+    "ipaddr.js": "2.5.0",
+    "jsdom": "30.0.1",
+    "jsonwebtoken": "9.0.3",
+    "pino": "10.3.1",
+    "playwright": "1.63.0"
+  }
+}

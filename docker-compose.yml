@@ -1,0 +1,362 @@
+# =============================================================================
+# contextual-rag — Event-Driven Contextual RAG topology
+#
+#   n8n-main ──▶ Redis (Bull queue) ◀── n8n-worker ×N
+#      │                                    │
+#      └── PostgreSQL (n8n state)           └──▶ FastAPI services (JWT-protected)
+#   n8n-webhook (scaled webhook intake)          extraction ─▶ defuddle-sidecar
+#                                                 chunking   ─▶ Anthropic + Qdrant
+#                                                 retrieval  ─▶ Qdrant + Cohere
+#
+# All secrets come from .env (see .env.example). Nothing is hard-coded here.
+# `docker compose up -d --wait` returns only when every service is healthy.
+# =============================================================================
+name: contextual-rag
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+# ---------------------------------------------------------------------------
+# n8n: shared configuration for main, worker and webhook processors.
+# Queue mode + identical encryption key + WEBHOOK_URL on every instance.
+# ---------------------------------------------------------------------------
+x-n8n-common: &n8n-common
+  image: n8nio/n8n:${N8N_IMAGE_TAG:-2.40.1}
+  restart: unless-stopped
+  logging: *default-logging
+  networks: [rag]
+  environment: &n8n-env
+    # -- database --
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_PORT: "5432"
+    DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME:-n8n}
+    DB_POSTGRESDB_USER: ${POSTGRES_USER}
+    DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+    # -- queue mode (Bull on Redis db 0) --
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: redis
+    QUEUE_BULL_REDIS_PORT: "6379"
+    QUEUE_BULL_REDIS_DB: "0"
+    QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+    QUEUE_HEALTH_CHECK_ACTIVE: "true"        # /healthz + /healthz/readiness on workers
+    OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+    N8N_GRACEFUL_SHUTDOWN_TIMEOUT: "60"
+    # -- shared secrets / URL resolution (must be identical everywhere) --
+    N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+    WEBHOOK_URL: ${N8N_WEBHOOK_URL}          # prevents workers resolving to localhost:5678
+    N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL}
+    N8N_HOST: ${N8N_HOST:-localhost}
+    N8N_PORT: "5678"
+    N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+    # -- n8n 2.x hardening --
+    N8N_RUNNERS_MODE: internal               # task runners are on by default in 2.x
+    N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+    N8N_DEFAULT_BINARY_DATA_MODE: database   # in-memory mode removed in 2.x; DB needs no shared volume
+    N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+    N8N_DIAGNOSTICS_ENABLED: "false"
+    N8N_HIRING_BANNER_ENABLED: "false"
+    N8N_LOG_LEVEL: info
+    N8N_LOG_OUTPUT: console
+    GENERIC_TIMEZONE: ${TZ:-UTC}
+    TZ: ${TZ:-UTC}
+
+# ---------------------------------------------------------------------------
+# FastAPI services: shared configuration.
+# ---------------------------------------------------------------------------
+x-python-service: &python-service
+  restart: unless-stopped
+  logging: *default-logging
+  networks: [rag]
+  environment: &python-env
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    OTEL_SERVICE_NAMESPACE: contextual-rag
+    REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+    SERVICE_JWT_SECRET: ${SERVICE_JWT_SECRET}
+    SERVICE_JWT_ISSUER: ${SERVICE_JWT_ISSUER:-contextual-rag}
+    SERVICE_JWT_AUDIENCE: ${SERVICE_JWT_AUDIENCE:-rag-services}
+    ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,extraction-service,chunking-service,retrieval-service}
+    CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:5678}
+    RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-120}
+    RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+
+x-python-healthcheck: &python-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 60s
+
+services:
+  # ===========================================================================
+  # Stateful backends
+  # ===========================================================================
+  postgres:
+    image: postgres:17.11-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [rag]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      N8N_DB_NAME: ${N8N_DB_NAME:-n8n}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -h 127.0.0.1 forces TCP so the socket-only bootstrap server used while
+      # init scripts run does NOT report healthy prematurely.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7.4.11-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [rag]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    # noeviction is mandatory for Bull queues; appendonly persists the queue + DLQ.
+    command: >
+      sh -c 'exec redis-server --requirepass "$$REDIS_PASSWORD"
+             --appendonly yes --maxmemory-policy noeviction'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_IMAGE_TAG:-v1.19.1}
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [rag]
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__TELEMETRY_DISABLED: "true"
+    ports:
+      - "127.0.0.1:6333:6333"   # REST + dashboard (local only)
+      - "127.0.0.1:6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # The image ships no curl/wget; bash /dev/tcp confirms the REST listener is up.
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ===========================================================================
+  # n8n queue-mode topology
+  # ===========================================================================
+  n8n-main:
+    <<: *n8n-common
+    container_name: n8n-main
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/home/node/workflows:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  n8n-worker:
+    <<: *n8n-common
+    command: worker
+    environment:
+      <<: *n8n-env
+      # 10 concurrent jobs per worker keeps memory predictable; scale horizontally
+      # with `docker compose up -d --scale n8n-worker=3` instead of raising this.
+      N8N_CONCURRENCY_PRODUCTION_LIMIT: "10"
+    depends_on:
+      n8n-main:
+        condition: service_healthy   # main runs DB migrations first
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz/readiness >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  n8n-webhook:
+    <<: *n8n-common
+    command: webhook
+    ports:
+      - "5679:5678"   # route /webhook/* here from a load balancer in production
+    depends_on:
+      n8n-main:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ===========================================================================
+  # RAG microservices
+  # ===========================================================================
+  defuddle-sidecar:
+    build:
+      context: ./services/defuddle_sidecar
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [rag]
+    environment:
+      PORT: "3000"
+      SERVICE_JWT_SECRET: ${SERVICE_JWT_SECRET}
+      SERVICE_JWT_ISSUER: ${SERVICE_JWT_ISSUER:-contextual-rag}
+      SERVICE_JWT_AUDIENCE: ${SERVICE_JWT_AUDIENCE:-rag-services}
+      MAX_PAYLOAD_BYTES: ${EXTRACTION_MAX_PAYLOAD_BYTES:-10485760}
+      RENDER_TIMEOUT_MS: "20000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Chromium needs a bigger /dev/shm than Docker's 64 MB default.
+    shm_size: "512m"
+    init: true   # reap Chromium zombies
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  extraction-service:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: services/extraction_service/Dockerfile
+    environment:
+      <<: *python-env
+      SERVICE_NAME: extraction-service
+      DEFUDDLE_SIDECAR_URL: http://defuddle-sidecar:3000
+      EXTRACTION_MAX_PAYLOAD_BYTES: ${EXTRACTION_MAX_PAYLOAD_BYTES:-10485760}
+      EXTRACTION_FETCH_TIMEOUT_SECONDS: ${EXTRACTION_FETCH_TIMEOUT_SECONDS:-15}
+      EXTRACTION_MAX_REDIRECTS: ${EXTRACTION_MAX_REDIRECTS:-3}
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      defuddle-sidecar:
+        condition: service_healthy
+    healthcheck: *python-healthcheck
+
+  chunking-service:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: services/contextual_chunking_service/Dockerfile
+    environment:
+      <<: *python-env
+      SERVICE_NAME: contextual-chunking-service
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
+      ANTHROPIC_CACHE_MIN_TOKENS: ${ANTHROPIC_CACHE_MIN_TOKENS:-4096}
+      ANTHROPIC_MAX_CONCURRENCY: ${ANTHROPIC_MAX_CONCURRENCY:-4}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_GRPC_PORT: "6334"
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+      DENSE_MODEL: ${DENSE_MODEL:-BAAI/bge-small-en-v1.5}
+      SPARSE_MODEL: ${SPARSE_MODEL:-Qdrant/bm25}
+      COLBERT_MODEL: ${COLBERT_MODEL:-colbert-ir/colbertv2.0}
+      FASTEMBED_CACHE_PATH: /models
+    ports:
+      - "127.0.0.1:8002:8000"
+    volumes:
+      - fastembed_cache:/models
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-healthcheck
+      start_period: 600s   # first boot downloads three FastEmbed models (~600 MB)
+
+  retrieval-service:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: services/retrieval_service/Dockerfile
+    environment:
+      <<: *python-env
+      SERVICE_NAME: retrieval-service
+      COHERE_API_KEY: ${COHERE_API_KEY}
+      COHERE_RERANK_MODEL: ${COHERE_RERANK_MODEL:-rerank-v4.0-pro}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_GRPC_PORT: "6334"
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+      DENSE_MODEL: ${DENSE_MODEL:-BAAI/bge-small-en-v1.5}
+      SPARSE_MODEL: ${SPARSE_MODEL:-Qdrant/bm25}
+      COLBERT_MODEL: ${COLBERT_MODEL:-colbert-ir/colbertv2.0}
+      FASTEMBED_CACHE_PATH: /models
+    ports:
+      - "127.0.0.1:8003:8000"
+    volumes:
+      - fastembed_cache:/models
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-healthcheck
+      start_period: 600s
+
+  # ===========================================================================
+  # Optional observability backend:  docker compose --profile observability up
+  # ===========================================================================
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    profiles: [observability]
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [rag]
+    ports:
+      - "127.0.0.1:16686:16686"   # UI
+      - "127.0.0.1:4317:4317"     # OTLP gRPC
+      - "127.0.0.1:4318:4318"     # OTLP HTTP
+
+networks:
+  rag:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  n8n_data:
+  # Shared by chunking + retrieval: identical models, downloaded once (~600 MB).
+  fastembed_cache:

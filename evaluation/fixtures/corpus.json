@@ -1,0 +1,53 @@
+{
+  "description": "Small self-describing corpus used by the ColBERT latency benchmark (seeded into Qdrant) and as the ground truth behind eval_dataset.json.",
+  "documents": [
+    {
+      "document_id": "doc-contextual-retrieval",
+      "title": "Contextual Retrieval",
+      "source_url": "https://example.com/kb/contextual-retrieval",
+      "text": "Contextual retrieval is an indexing technique in which every chunk of a document is prepended with a short, chunk-specific context before it is embedded. The context is written by a language model that reads the whole document together with the chunk, and it states what the chunk is about and how it relates to the rest of the document.\n\nThe main failure mode that contextual retrieval fixes is the loss of context that happens when a document is split into chunks. A chunk that says 'revenue grew 3% over the previous quarter' does not mention the company or the quarter, so neither a dense embedding nor a BM25 index can match it to a question that names them. With the situating context added, the chunk becomes self-describing.\n\nBecause the same document is sent once per chunk, contextual retrieval is only economical with prompt caching. The full document is placed first in the prompt and marked as a cache breakpoint, so every chunk request after the first reads the document from cache instead of paying for it again. Anthropic reported that combining contextual embeddings with contextual BM25 reduced the top-20 retrieval failure rate by 49%, and by 67% once a reranker was added."
+    },
+    {
+      "document_id": "doc-prompt-caching",
+      "title": "Prompt Caching Rules",
+      "source_url": "https://example.com/kb/prompt-caching",
+      "text": "Prompt caching in the Claude API is a prefix match. The request is rendered in the order tools, then system, then messages, and a cache breakpoint marks the end of the prefix that should be cached. Any byte that changes anywhere in that prefix invalidates the cache for everything after it, so stable content must come first and volatile content such as timestamps or the current question must come after the last breakpoint.\n\nEach request may contain at most four cache breakpoints, set with a cache_control block of type ephemeral. The default time to live is five minutes and a cache read refreshes the timer at no extra cost, so a stream of requests that share a prefix and start less than five minutes apart keeps the entry warm indefinitely.\n\nThe minimum cacheable prefix length depends on the model. Claude Haiku 3.5 required 2048 tokens; Claude Haiku 4.5 requires 4096 tokens; Claude Opus 5 caches prefixes as short as 512 tokens. Prefixes shorter than the minimum are silently not cached: the request succeeds, but usage reports zero cache creation and zero cache read tokens. Cache writes cost 1.25 times the base input price for the five-minute TTL and cache reads cost roughly one tenth of the base price."
+    },
+    {
+      "document_id": "doc-hybrid-search",
+      "title": "Hybrid Search in Qdrant",
+      "source_url": "https://example.com/kb/hybrid-search",
+      "text": "Hybrid search combines a dense vector index with a sparse lexical index. The dense vectors, here 384-dimensional embeddings from BAAI/bge-small-en-v1.5 compared with cosine distance, capture semantic similarity. The sparse vectors are BM25 term weights produced client-side by FastEmbed; the collection declares the IDF modifier so that Qdrant applies inverse document frequency on the server.\n\nQdrant's Universal Query API executes the whole hybrid pipeline in one request. Two prefetch branches retrieve the top candidates from the dense and sparse indexes, and a fusion query of type RRF merges the two ranked lists with reciprocal rank fusion, which scores each document by the sum of 1 divided by (k plus its rank) across the lists.\n\nThe fused list can itself be reranked by a ColBERT multivector. ColBERT encodes every token as a 128-dimensional vector and scores a document with MaxSim: for each query token it takes the maximum similarity over the document tokens and sums those maxima. Because ColBERT is only used to rerank a few dozen prefetched candidates, its HNSW index is disabled by setting m to zero, which avoids indexing millions of token vectors."
+    },
+    {
+      "document_id": "doc-reranking",
+      "title": "Cohere Reranking",
+      "source_url": "https://example.com/kb/reranking",
+      "text": "A cross-encoder reranker reads the query and a candidate document together and outputs a relevance score, which is more accurate than comparing independent embeddings but too expensive to run over a whole corpus. The retrieval service therefore sends only the top twenty fused candidates to Cohere's rerank endpoint and keeps the top five.\n\nCohere's v2 rerank API takes the documents as plain strings. Semi-structured chunks are rendered as YAML with the keys in a fixed order, title then context then text, because the order in which the reranker reads the fields affects its scores. The response contains an index for each result that points back into the list of documents that was sent, plus a relevance score between zero and one; the service maps the indexes back to the original chunks and sorts by relevance score.\n\nThe rerank client uses a full-jitter retry policy for rate limits: at most five retries, with a delay drawn uniformly between zero and the minimum of thirty seconds and one second times two to the power of the attempt number. A Retry-After header from the API is honoured when it is longer than the jittered delay."
+    },
+    {
+      "document_id": "doc-dlq",
+      "title": "Dead-Letter Queue and Observability",
+      "source_url": "https://example.com/kb/dlq",
+      "text": "Every failed pipeline stage writes an entry to a Redis Stream named rag.dlq. Each entry carries exactly five fields: document_id, stage, error_type, error_message and timestamp. The stage is one of extraction, chunking, indexing, retrieval, rerank or orchestration, and the timestamp is an ISO 8601 UTC value with millisecond precision.\n\nThe stream is capped at one hundred thousand entries with approximate trimming so that a burst of failures cannot exhaust Redis memory. Consumers read the stream with XREAD or XREADGROUP; the n8n error workflow publishes orchestration failures through the /internal/dlq endpoint because n8n's Redis node cannot execute XADD.\n\nAll services emit one JSON object per log line with the fields timestamp, level, logger, service, message, request_id, trace_id and span_id. Trace and span identifiers come from OpenTelemetry, which exports spans over OTLP gRPC to Jaeger when OTEL_EXPORTER_OTLP_ENDPOINT is set."
+    },
+    {
+      "document_id": "doc-n8n-queue",
+      "title": "n8n Queue Mode",
+      "source_url": "https://example.com/kb/n8n-queue-mode",
+      "text": "In queue mode n8n is split into a main instance, worker instances and webhook processors. The main instance owns the editor, timers and trigger registration; it pushes execution ids onto a Bull queue in Redis and workers pick them up, load the workflow from PostgreSQL and run it. Webhook processors accept incoming webhook requests on port 5678 and enqueue them so that intake scales independently of execution.\n\nThree settings are mandatory on every instance: EXECUTIONS_MODE must be queue, QUEUE_BULL_REDIS_HOST must point at the shared Redis, and N8N_ENCRYPTION_KEY must be identical everywhere so that workers can decrypt credentials stored by the main instance. WEBHOOK_URL must also be set on the main instance and on the workers, otherwise nodes running on a worker build webhook URLs that resolve to localhost:5678.\n\nWorker throughput is bounded by N8N_CONCURRENCY_PRODUCTION_LIMIT, which defaults to ten concurrent executions per worker; scaling out by adding workers is preferred over raising the limit because each execution holds its own memory. n8n 2.x enables task runners by default, blocks environment variable access from the Code node and stores binary data in the database when running in queue mode."
+    }
+  ],
+  "queries": [
+    {"query": "How does contextual retrieval fix the lost-context problem in chunked documents?", "relevant_document_ids": ["doc-contextual-retrieval"]},
+    {"query": "What is the minimum prompt length that Claude Haiku 4.5 will cache?", "relevant_document_ids": ["doc-prompt-caching"]},
+    {"query": "How many cache breakpoints can a single request have and what is their TTL?", "relevant_document_ids": ["doc-prompt-caching"]},
+    {"query": "How does reciprocal rank fusion combine dense and sparse results in Qdrant?", "relevant_document_ids": ["doc-hybrid-search"]},
+    {"query": "Why is HNSW disabled for the ColBERT vectors?", "relevant_document_ids": ["doc-hybrid-search"]},
+    {"query": "What retry policy does the Cohere rerank client use for 429 errors?", "relevant_document_ids": ["doc-reranking"]},
+    {"query": "Which fields does a rag.dlq entry contain?", "relevant_document_ids": ["doc-dlq"]},
+    {"query": "Which environment variables must be identical on n8n main and worker instances?", "relevant_document_ids": ["doc-n8n-queue"]},
+    {"query": "What happens if WEBHOOK_URL is not set on n8n workers?", "relevant_document_ids": ["doc-n8n-queue"]},
+    {"query": "How are documents formatted before being sent to the reranker?", "relevant_document_ids": ["doc-reranking"]}
+  ]
+}

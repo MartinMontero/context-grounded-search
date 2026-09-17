@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Contextual Retrieval Explained</title>
+  <meta name="author" content="Jane Doe">
+  <meta property="article:published_time" content="2024-05-01">
+  <meta name="description" content="How contextual retrieval improves RAG recall.">
+</head>
+<body>
+  <nav>Home | About | Contact</nav>
+  <article>
+    <h1>Contextual Retrieval Explained</h1>
+    <p>Contextual retrieval improves RAG by prepending chunk-specific context before embedding each
+    chunk. The context is generated once per chunk by a small model that reads the whole document,
+    which makes prompt caching essential: the document block stays byte-identical across requests so
+    every chunk after the first is a cache read rather than a cache write.</p>
+    <p>Hybrid search then combines dense embeddings, BM25 sparse vectors and ColBERT late interaction.
+    Reciprocal rank fusion merges the dense and sparse candidate lists, and the multivector comparator
+    reranks the fused list with MaxSim before a cross-encoder reranker produces the final order.</p>
+    <table><tr><th>Stage</th><th>Model</th></tr><tr><td>Contextualize</td><td>Haiku</td></tr></table>
+  </article>
+  <footer>Copyright 2024 Example Inc.</footer>
+</body>
+</html>

@@ -1,0 +1,109 @@
+{
+  "additionalProperties": false,
+  "description": "One retrievable unit: the original chunk plus its LLM-generated situating context.",
+  "properties": {
+    "chunk_id": {
+      "description": "uuid5(document_id, chunk_index); stable across re-ingests",
+      "title": "Chunk Id",
+      "type": "string"
+    },
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "chunk_index": {
+      "minimum": 0,
+      "title": "Chunk Index",
+      "type": "integer"
+    },
+    "text": {
+      "description": "Original chunk text",
+      "title": "Text",
+      "type": "string"
+    },
+    "context": {
+      "description": "Succinct context situating the chunk in the document",
+      "title": "Context",
+      "type": "string"
+    },
+    "contextualized_text": {
+      "description": "`context + '\\n\\n' + text`; this is what gets embedded",
+      "title": "Contextualized Text",
+      "type": "string"
+    },
+    "start_char": {
+      "minimum": 0,
+      "title": "Start Char",
+      "type": "integer"
+    },
+    "end_char": {
+      "minimum": 0,
+      "title": "End Char",
+      "type": "integer"
+    },
+    "token_estimate": {
+      "minimum": 1,
+      "title": "Token Estimate",
+      "type": "integer"
+    },
+    "tenant_id": {
+      "title": "Tenant Id",
+      "type": "string"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Title"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source"
+    },
+    "source_url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Url"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "chunk_id",
+    "document_id",
+    "chunk_index",
+    "text",
+    "context",
+    "contextualized_text",
+    "start_char",
+    "end_char",
+    "token_estimate",
+    "tenant_id"
+  ],
+  "title": "ContextualChunk",
+  "type": "object"
+}
