@@ -1,4 +1,4 @@
-# contextual-rag
+# Contextual Retrieval-Augmented Generation (rag)
 
 A document processing pipeline that makes AI answers more accurate by giving the AI
 better context about what it's searching through.
