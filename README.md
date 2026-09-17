@@ -1,17 +1,38 @@
-# Contextual Retrieval-Augmented Generation (rag)
+# context-grounded-search
 
-A document processing pipeline that makes AI answers more accurate by giving the AI
-better context about what it's searching through.
+## The problem
 
-Here's the idea: when you feed a document into this system, it doesn't just chop it into
-pieces and search them later. It uses Claude (Anthropic's AI) to read the *whole* document
-and write a short summary for each piece, explaining where that piece fits in the bigger
-picture. When someone later asks a question, the system searches those enriched pieces
-using three different search strategies at once, then ranks the results with a separate
-reranking model. The result is more relevant answers with less hallucination.
+You've got thousands of newsletters, articles, emails, and documents full of insights
+from people you trust — but they're trapped in inboxes and folders designed for reading
+one at a time. You don't have the time or headspace to re-read thousands of posts to find
+the one insight you need right now. What you actually want is to *ask questions* and get
+answers grounded in everything you've already collected.
+
+Most AI search tools chop your documents into small pieces and try to match keywords or
+meaning against your question. The problem is that each piece loses the context of the
+document it came from — so the AI is searching fragments without understanding the bigger
+picture, and the answers suffer for it.
+
+## What this does differently
+
+This system processes your documents so AI can actually understand them in context — and
+give you answers that are grounded in what your sources actually said, not hallucinated
+from thin air.
+
+When you feed a document in, it doesn't just chop it into pieces and search them later.
+It uses Claude (Anthropic's AI) to read the *whole* document and write a short summary
+for each piece, explaining where that piece fits in the bigger picture. When you later
+ask a question, the system searches those enriched pieces using three different search
+strategies at once, then ranks the results with a separate reranking model. The result
+is more relevant answers with less hallucination.
+
+Think of it as turning your personal archive — newsletters, articles, emails, research —
+into an on-demand knowledge base you can query for advice, answers, and context whenever
+you need it.
 
 The whole thing runs as a set of small, independent services coordinated by n8n (a
-workflow automation tool). You bring your own API keys — nothing is hard-coded or shared.
+workflow automation tool), all inside Docker on your own machine. You bring your own API
+keys — nothing is hard-coded or shared.
 
 ```
                 ┌──────────────┐   job queue    ┌──────────────┐
