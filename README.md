@@ -1,17 +1,24 @@
 # contextual-rag
 
-Event-driven **Contextual RAG** pipeline: n8n (queue mode) orchestrates three
-JWT-protected FastAPI services that extract documents, situate every chunk with
-Claude (prompt-cached contextual retrieval), index dense + BM25 + ColBERT vectors
-into Qdrant, and answer queries with hybrid search, ColBERT late interaction and
-Cohere reranking. RAGAS gates quality in CI.
+A document processing pipeline that makes AI answers more accurate by giving the AI
+better context about what it's searching through.
+
+Here's the idea: when you feed a document into this system, it doesn't just chop it into
+pieces and search them later. It uses Claude (Anthropic's AI) to read the *whole* document
+and write a short summary for each piece, explaining where that piece fits in the bigger
+picture. When someone later asks a question, the system searches those enriched pieces
+using three different search strategies at once, then ranks the results with a separate
+reranking model. The result is more relevant answers with less hallucination.
+
+The whole thing runs as a set of small, independent services coordinated by n8n (a
+workflow automation tool). You bring your own API keys — nothing is hard-coded or shared.
 
 ```
-                ┌──────────────┐   Bull queue   ┌──────────────┐
+                ┌──────────────┐   job queue    ┌──────────────┐
   webhooks ───▶ │  n8n-main    │ ──▶ Redis ◀─── │ n8n-worker×N │ ──┐  HTTP + JWT
   webhooks ───▶ │  n8n-webhook │      │         └──────────────┘   │
                 └──────┬───────┘      │                            ▼
-                       │ PostgreSQL   │  DLQ stream rag.dlq   ┌────────────────────┐
+                       │ PostgreSQL   │  error queue           ┌────────────────────┐
                        ▼              └───────────────────────│ extraction-service │──▶ defuddle-sidecar
                                                               │ chunking-service   │──▶ Anthropic + Qdrant
                                                               │ retrieval-service  │──▶ Qdrant + Cohere
@@ -21,197 +28,326 @@ Cohere reranking. RAGAS gates quality in CI.
 ## Quick start
 
 ```bash
-cp .env.example .env            # or: make env  (generates the secrets for you)
-#   fill in ANTHROPIC_API_KEY, COHERE_API_KEY (OPENAI_API_KEY optional)
-make up                         # docker compose up -d --build --wait  → all services healthy
-make import-workflows           # load n8n/workflows/*.json into n8n-main
-make token SUB=n8n              # mint the JWT for n8n's "RAG Service JWT" header credential
+cp .env.example .env            # or: make env  (generates secrets for you)
 ```
 
-| Service | Host port | Docs |
-|---|---|---|
-| n8n editor / webhooks | 5678 (webhook processor: 5679) | http://localhost:5678 |
-| extraction-service | 8001 | http://localhost:8001/docs |
-| chunking-service | 8002 | http://localhost:8002/docs |
-| retrieval-service | 8003 | http://localhost:8003/docs |
-| Qdrant dashboard | 6333 | http://localhost:6333/dashboard |
-| Jaeger UI (`--profile observability`) | 16686 | http://localhost:16686 |
+Open `.env` and fill in your API keys: `ANTHROPIC_API_KEY` and `COHERE_API_KEY` are
+required, `OPENAI_API_KEY` is optional (used only for evaluation embeddings).
 
-Every FastAPI service exposes unauthenticated `GET /health` (liveness) and
-`GET /ready` (dependency checks: Redis, Qdrant collection, sidecar, API keys → 503 until green).
-Everything else needs `Authorization: Bearer <service JWT>` and is rate limited per caller.
+```bash
+make up                         # builds and starts all services — waits until everything is healthy
+make import-workflows           # loads the three n8n workflows into the n8n editor
+make token SUB=n8n              # creates the authentication token n8n needs to call the services
+```
+
+| What | Where | Notes |
+|---|---|---|
+| n8n editor (build and run workflows) | [localhost:5678](http://localhost:5678) | webhook processor on port 5679 |
+| Extraction service (pull text from URLs/emails) | [localhost:8001/docs](http://localhost:8001/docs) | interactive API docs |
+| Chunking service (split + contextualize + index) | [localhost:8002/docs](http://localhost:8002/docs) | interactive API docs |
+| Retrieval service (search + rerank) | [localhost:8003/docs](http://localhost:8003/docs) | interactive API docs |
+| Qdrant dashboard (see your indexed vectors) | [localhost:6333/dashboard](http://localhost:6333/dashboard) | |
+| Jaeger tracing UI (optional, see below) | [localhost:16686](http://localhost:16686) | only with `--profile observability` |
+
+Every service has two health-check endpoints that don't need authentication:
+- `GET /health` — "is the service running?" (basic liveness check)
+- `GET /ready` — "is everything this service depends on actually working?" (checks Redis, Qdrant, API keys, etc. — returns 503 until all dependencies are confirmed)
+
+Everything else requires a signed token in the `Authorization: Bearer <token>` header,
+and every caller is rate-limited to prevent abuse.
 
 ```bash
 TOKEN=$(make -s token)
-curl -s localhost:8001/v1/extract/url -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+
+# Step 1: Extract text from a URL
+curl -s localhost:8001/v1/extract/url \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
   -d '{"url":"https://example.com/article","document_id":"kb-001"}'
-curl -s localhost:8002/v1/index -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+
+# Step 2: Contextualize, embed, and index the extracted text
+curl -s localhost:8002/v1/index \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
   -d '{"document_id":"kb-001","text":"...extracted markdown...","title":"Article","tenant_id":"acme"}'
-curl -s localhost:8003/v1/search -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+
+# Step 3: Search your indexed documents
+curl -s localhost:8003/v1/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
   -d '{"query":"how does contextual retrieval work","top_k":5,"tenant_id":"acme"}'
 ```
 
 ## Repository layout
 
 ```
-docker-compose.yml           full topology, health checks, depends_on conditions
-.env.example                 every variable, no secrets
-pyproject.toml               one distribution, exact pins, extras per service (+ eval, dev)
-packages/rag_common/         shared runtime: settings, JSON logs, OTel, JWT, rate limit, DLQ,
-                             retry (full jitter), health, middleware order, app factory,
-                             Qdrant collection schema, FastEmbed hybrid embedder
-services/extraction_service/ MIME (email.policy.default) + trafilatura + SSRF-safe fetch
-services/defuddle_sidecar/   Node.js: Defuddle (JSDOM) + Playwright/Chromium, Shadow-DOM flattening
-services/contextual_chunking_service/  Claude contextual retrieval + Qdrant indexing
-services/retrieval_service/  Universal Query (RRF → ColBERT) + Cohere rerank
-n8n/workflows/               ingest, query and DLQ error-handler workflows (importable JSON)
-evaluation/                  RAGAS eval (fixtures, thresholds, CLI), corpus for the benchmark
-benchmarks/                  ColBERT latency benchmark
-schemas/                     exported ContextualChunk JSON Schema (test-enforced)
-scripts/                     mint_service_token.py, export_schemas.py
-.github/workflows/ci.yml     lint, tests, sidecar tests, compose config/lint, stack smoke test, RAGAS gate
+docker-compose.yml           all the services and how they connect, with health checks
+.env.example                 every configuration variable, no real secrets
+pyproject.toml               shared Python project config with pinned dependencies
+packages/rag_common/         shared code used by all three Python services (see section 2)
+services/extraction_service/ pulls text out of web pages, emails, and raw HTML
+services/defuddle_sidecar/   a Node.js helper that renders JavaScript-heavy pages in a real browser
+services/contextual_chunking_service/  splits documents, adds context with Claude, stores in Qdrant
+services/retrieval_service/  searches Qdrant and reranks results with Cohere
+n8n/workflows/               three pre-built workflows: ingest, search, and error handling
+evaluation/                  automated quality testing using the RAGAS framework
+benchmarks/                  performance benchmarks for the ColBERT search layer
+schemas/                     exported data schemas (kept in sync by tests)
+scripts/                     utility scripts (token minting, schema export)
+.github/workflows/ci.yml     automated checks: linting, tests, type checking, smoke tests
 ```
 
-## 1 · Infrastructure (docker-compose)
+## 1 · Infrastructure (Docker Compose)
 
-* **PostgreSQL 17** (n8n state; `docker/postgres/initdb` creates the `n8n` database),
-  health check `pg_isready -h 127.0.0.1` so the socket-only bootstrap phase never reports healthy.
-* **Redis 7.4** with `--requirepass`, `appendonly`, `maxmemory-policy noeviction` (mandatory for Bull);
-  db 0 = n8n queue, db 1 = rate limiting + DLQ. Health: authenticated `PING`.
-* **Qdrant v1.19.1** with API key, gRPC on 6334; health via bash `/dev/tcp` (the image has no curl).
-* **n8n 2.40.1** as `n8n-main`, `n8n-worker` (`command: worker`) and `n8n-webhook` (`command: webhook`),
-  sharing one anchored environment:
-  `EXECUTIONS_MODE=queue`, `QUEUE_BULL_REDIS_HOST=redis`, one `N8N_ENCRYPTION_KEY`,
-  **`WEBHOOK_URL` on every instance** (otherwise workers build `localhost:5678` URLs),
-  `N8N_CONCURRENCY_PRODUCTION_LIMIT=10` on workers, `QUEUE_HEALTH_CHECK_ACTIVE=true` for
-  worker `/healthz` + `/healthz/readiness`, plus the n8n 2.x defaults made explicit
-  (`N8N_RUNNERS_MODE=internal`, `N8N_BLOCK_ENV_ACCESS_IN_NODE=true`, `N8N_DEFAULT_BINARY_DATA_MODE=database`).
-  Workers depend on a healthy main (migrations run first); scale with `--scale n8n-worker=3`.
-* FastAPI services and the sidecar build from the repo; `depends_on` uses `condition: service_healthy`
-  throughout so `docker compose up --wait` returns only when the whole graph is green.
-* `--profile observability` adds Jaeger (OTLP gRPC 4317) — set `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317`.
+Everything runs in Docker containers, orchestrated by a single `docker-compose.yml` file.
+When you run `docker compose up --wait`, it starts services in the right order and waits
+for each one to report healthy before starting anything that depends on it.
 
-## 2 · Shared service runtime (`rag_common`)
+The supporting services:
 
-* **Settings**: pydantic-settings v2 with `SettingsConfigDict`, `validation_alias` per env var,
-  `SecretStr` for secrets, CSV list parsing, `@lru_cache get_settings()` per service.
-* **Middleware order** (asserted by a test): `CORSMiddleware → TrustedHostMiddleware → GZipMiddleware →
-  RequestContext` (request-id propagation, security headers, structured access log, 500 envelope).
-* **Auth**: HS256 service JWTs (`iss`/`aud`/`sub`/`exp`/`iat`/`jti` required, `alg` pinned).
-  Mint with `scripts/mint_service_token.py`; the Node sidecar verifies the same tokens.
-* **Rate limiting**: Redis fixed window keyed by JWT subject (`INCR`+`EXPIRE` in a MULTI), standard
-  `X-RateLimit-*` headers, `429` + `Retry-After`; fail-open is configurable.
-* **DLQ**: Redis Stream `rag.dlq`, fields exactly `document_id, stage, error_type, error_message, timestamp`;
-  `dlq.guard()` wraps each stage; `POST /internal/dlq` lets the n8n error workflow publish.
-* **Observability**: one JSON object per log line with `trace_id`/`span_id`/`request_id`; OpenTelemetry
-  tracer with FastAPI, httpx and redis instrumentation; OTLP export when an endpoint is configured.
-* **Errors**: uniform `{"error": {"type", "message", "request_id", "details"}}` envelope.
+- **PostgreSQL 17** stores n8n's workflow data and execution history. Its health check
+  verifies the database is accepting connections (not just starting up).
+- **Redis 7.4** does double duty: it's the job queue for n8n (database 0) and also
+  handles rate limiting and the error queue (database 1). It requires a password and
+  keeps data on disk so nothing is lost on restart.
+- **Qdrant 1.19.1** is the vector database where all the document chunks and their
+  embeddings are stored. It requires an API key and exposes both HTTP and gRPC ports.
+
+n8n (the workflow orchestrator) runs as three separate containers that work together:
+
+- **n8n-main** handles the editor UI and runs database migrations
+- **n8n-worker** picks jobs off the Redis queue and executes them (you can scale this
+  to multiple workers with `--scale n8n-worker=3`)
+- **n8n-webhook** receives incoming HTTP requests and queues them as jobs
+
+All three share the same configuration: queue mode enabled, a single encryption key,
+the same webhook URL (so workers know where to send callbacks), and security settings
+that prevent workflows from reading environment variables or accessing the filesystem.
+
+The three Python services and the Node.js sidecar are all built from this repo's Dockerfiles.
+
+**Optional observability:** Add `--profile observability` to your `docker compose up`
+command to include Jaeger, a distributed tracing system. Set
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317` in your `.env` to start sending traces.
+
+## 2 · Shared service code (`rag_common`)
+
+All three Python services share a common library that handles the basics so each service
+only has to implement its own logic:
+
+- **Configuration** — each service reads its settings from environment variables, with
+  type checking, defaults, and validation. Secrets (like API keys) are stored as
+  `SecretStr` so they never accidentally show up in logs or error messages.
+- **Middleware stack** — every incoming request goes through the same layers, in a
+  tested order: cross-origin handling, trusted host checking, response compression,
+  and then a request-context layer that assigns a unique ID to each request, adds
+  security headers, writes a structured log line, and wraps any uncaught errors in a
+  consistent format.
+- **Authentication** — services authenticate each other using JWT tokens (short-lived
+  signed tokens that carry the caller's identity). The token format is locked down:
+  it must include who issued it, who it's for, when it expires, and a unique ID.
+  The signing algorithm is pinned to HS256 so an attacker can't swap in a weaker one.
+  The same tokens work for both the Python services and the Node.js sidecar.
+- **Rate limiting** — each authenticated caller gets a fixed number of requests per time
+  window, tracked in Redis. Standard rate-limit headers tell the caller how many requests
+  they have left and when the window resets. If they exceed the limit, they get a 429
+  response with a `Retry-After` header. If Redis goes down, the limiter can be configured
+  to either fail open (allow all) or fail closed (deny all).
+- **Error queue (DLQ)** — when any processing stage fails, the error details (document ID,
+  which stage failed, error type, error message, timestamp) are written to a Redis Stream
+  called `rag.dlq`. There's an n8n workflow that monitors this queue and can alert on errors
+  or retry failed jobs.
+- **Logging and tracing** — every log line is a single JSON object with a trace ID, span
+  ID, and request ID so you can follow a request across services. When Jaeger is running,
+  traces are exported via OpenTelemetry with instrumentation on HTTP calls, Redis, and
+  the API framework itself.
+- **Error format** — all error responses follow the same shape:
+  `{"error": {"type", "message", "request_id", "details"}}` so callers always know what
+  to parse.
 
 ## 3 · Extraction service
 
-* `POST /v1/extract/mime` — raw `message/rfc822` body or multipart `file`; parsed with the stdlib
-  `email` package under `email.policy.default` (`get_body(('html','plain'))`, `iter_attachments()`),
-  HTML bodies cleaned by trafilatura in recall mode, attachment inventory with text for `text/*`.
-* `POST /v1/extract/html` — trafilatura 2.2 (lxml + `lxml_html_clean`) to Markdown with metadata;
-  `engine=auto` escalates thin results to the Defuddle sidecar, `engine=defuddle` forces it.
-* `POST /v1/extract/url` — **SSRF-hardened** fetch: http/https only, no userinfo, port allow-list,
-  hostname deny-list, DNS resolved *before* connecting with every A/AAAA record required to be public
-  (private, loopback, link-local, CGNAT, multicast, reserved, IPv4-mapped IPv6, ULA all blocked),
-  connection pinned to the validated IP (Host + SNI keep the name → no DNS rebinding), redirects followed
-  manually with re-validation per hop, content-type allow-list, streaming size cap, timeouts.
-  `render=true` sends the URL to the sidecar, which repeats the checks on every Chromium request.
-* **Defuddle sidecar** (`services/defuddle_sidecar`): Express + `defuddle/node` (JSDOM) and Playwright.
-  Before any page script runs it forces `attachShadow` to `mode: 'open'`, then flattens every shadow root
-  into its host so Defuddle sees Shadow-DOM content; `context.route` blocks non-public targets, media,
-  fonts and websockets. Runs as `pwuser` on the pinned `mcr.microsoft.com/playwright:v1.63.0-noble` image.
+This service pulls clean text out of different source formats:
+
+- **`POST /v1/extract/url`** — Give it a URL, and it fetches the page, strips out the
+  boilerplate (navigation, ads, sidebars), and returns the main content as Markdown.
+
+  This endpoint is hardened against SSRF attacks (where a server is tricked into making
+  requests to internal systems). Before connecting to any URL, it: only allows HTTP and
+  HTTPS, blocks private/internal IP addresses (localhost, 10.x.x.x, 169.254.x.x,
+  and many others including IPv6 equivalents), resolves the hostname to an IP address
+  *before* connecting and checks that the resolved address is public, pins the connection
+  to that verified IP so DNS can't change out from under it, re-checks every redirect
+  hop, limits file size, and enforces timeouts.
+
+  Set `render=true` to send the URL to the Defuddle sidecar for JavaScript-heavy pages
+  (the sidecar applies the same security checks to every request the browser makes).
+
+- **`POST /v1/extract/html`** — Give it raw HTML and get back clean Markdown. Uses
+  trafilatura for extraction. If the result looks thin, it can automatically escalate
+  to the Defuddle sidecar for a better extraction (`engine=auto`), or you can force
+  the sidecar with `engine=defuddle`.
+
+- **`POST /v1/extract/mime`** — Give it a raw email file (RFC 822 format), and it
+  extracts the body text (cleaning HTML if needed), lists attachments, and pulls text
+  from text-type attachments.
+
+- **Defuddle sidecar** — A Node.js service that runs a real Chromium browser (via
+  Playwright) for pages that need JavaScript to render their content. Before any page
+  scripts run, it forces all Shadow DOM elements to be visible so the content extractor
+  can see them. It blocks requests to private IP addresses, media files, fonts, and
+  WebSocket connections. Chromium runs as a non-root user on a pinned, versioned image.
 
 ## 4 · Contextual chunking service
 
-`POST /v1/chunk` (chunks + contexts) and `POST /v1/index` (chunk → contextualize → embed → upload).
+This is the core of the contextual retrieval approach. It takes extracted text and turns
+it into search-ready, context-enriched chunks stored in Qdrant.
 
-* Paragraph-aware splitting with word overlap (`CHUNK_WORDS`, `CHUNK_OVERLAP_WORDS`).
-* **Anthropic contextual retrieval** (`contextualizer.py`): the full document is rendered once into a
-  `<document>` text block with `"cache_control": {"type": "ephemeral"}` (5-minute TTL, the single
-  breakpoint of the four allowed) and placed **first** in the user message; the chunk-specific prompt
-  follows it. The block object is reused verbatim for every chunk of the document, so the cached prefix
-  (system prompt + document) is byte-identical across requests. The first chunk is sent alone to write
-  the cache; the remaining chunks fan out under a semaphore and read it. `count_tokens` measures the
-  prefix and the response reports `cache_eligible`, cache write/read tokens and a warning when no reads
-  were observed.
-* **Model note**: the spec's `claude-3-5-haiku-20241022` (2048-token cache minimum) was retired on
-  2026-02-19. The service defaults to the current Haiku generation, `claude-haiku-4-5`, whose minimum
-  is **4096** tokens; both are settings (`ANTHROPIC_MODEL`, `ANTHROPIC_CACHE_MIN_TOKENS`).
-* **Strict output schema**: `ContextualChunk` (`extra="forbid"`) — `schemas/contextual_chunk.schema.json`
-  is exported from the model and a test fails if it drifts; also served at `/v1/schemas/contextual-chunk`.
-* **Qdrant** (`rag_common/qdrant_schema.py`): `qdrant-client==1.19.1`, `prefer_grpc=True`.
-  Vectors: `dense` 384-d COSINE, `sparse` `SparseVectorParams(modifier=IDF)` with client-side
-  FastEmbed `Qdrant/bm25`, `colbert` 128-d COSINE `MultiVectorComparator.MAX_SIM` with `HnswConfigDiff(m=0)`.
-  Payload indexes (`document_id`, `tenant_id`, `source`, `chunk_index`, `created_at`) are created at
-  startup and **asserted immediately before** `upload_points(batch_size=64, parallel=2, wait=True)`.
-  Point ids are `uuid5(document_id, chunk_index)`; a re-ingest deletes the document's stale points first.
+**`POST /v1/index`** runs the full pipeline: split → contextualize → embed → store.
+**`POST /v1/chunk`** runs just the split + contextualize steps if you want the chunks
+without storing them.
+
+**How the splitting works:** The text is divided into paragraph-aware chunks of about
+300 words each, with 40 words of overlap between consecutive chunks so nothing falls
+through the cracks.
+
+**How contextualizing works (the key innovation):** For each chunk, Claude reads the
+*entire* document and writes a short summary explaining how that specific chunk fits
+into the whole. This is the "contextual retrieval" technique from Anthropic's research —
+it dramatically improves search accuracy because each chunk carries its own context
+instead of being an isolated fragment.
+
+To avoid re-reading the entire document for every single chunk (which would be expensive),
+the service uses Anthropic's prompt caching. The full document is sent as a cached block
+in the first request. Claude reads and caches it once, and all subsequent chunks in that
+document reuse the cache (which lasts 5 minutes). The first chunk is sent alone to
+establish the cache; then the remaining chunks fan out in parallel under a concurrency
+limit. The response includes cache hit/miss statistics so you can verify it's working.
+
+**Model note:** The system defaults to `claude-haiku-4-5` (Anthropic's fast, affordable
+model). You can change this with the `ANTHROPIC_MODEL` environment variable. The cache
+requires a minimum of 4,096 tokens in the cached block — smaller documents won't benefit
+from caching.
+
+**How the embeddings work:** Each chunk is converted into three different kinds of
+searchable vectors:
+
+1. **Dense vectors** (384 dimensions) — the standard "meaning-based" embedding. Good
+   at finding conceptually similar content even when the exact words differ.
+2. **Sparse vectors (BM25)** — keyword-based scoring with IDF weighting. Good at
+   finding exact term matches, especially for technical jargon or proper nouns that
+   dense embeddings might miss.
+3. **ColBERT multi-vectors** (128 dimensions each) — a more granular approach where
+   each *token* in the chunk gets its own vector. This enables fine-grained matching
+   where individual words in the query are compared against individual words in the
+   chunk. Qdrant's MaxSim comparator finds the best alignment.
+
+All three are generated locally using FastEmbed (no external API calls for embeddings).
+
+**How storage works:** Points are uploaded to Qdrant with deterministic IDs (based on
+document ID + chunk index), so re-indexing a document automatically replaces its old
+chunks. The collection has indexes on `document_id`, `tenant_id`, `source`, `chunk_index`,
+and `created_at` for fast filtered queries.
+
+**Strict data validation:** The output schema (`ContextualChunk`) is exported to
+`schemas/contextual_chunk.schema.json` and a test fails if the code's model and the
+exported schema ever get out of sync.
 
 ## 5 · Retrieval service
 
-`POST /v1/search` runs one Universal Query request:
+**`POST /v1/search`** takes a query and returns the most relevant chunks, using all
+three search strategies together in a single request to Qdrant:
 
-```python
-client.query_points(
-    collection_name=...,
-    prefetch=[
-        models.Prefetch(  # nested prefetch object
-            prefetch=[
-                models.Prefetch(query=dense_vec, using="dense", limit=100),
-                models.Prefetch(query=models.SparseVector(...), using="sparse", limit=100),
-            ],
-            query=models.RrfQuery(rrf=models.Rrf()),  # fuse dense + sparse
-            limit=50,
-        )
-    ],
-    query=colbert_multivector,
-    using="colbert",  # MaxSim rerank of the fused candidates
-    limit=20,
-)
-```
+1. **First pass — hybrid search:** The query is embedded using both dense and sparse
+   (BM25) vectors. Both sets of results (up to 100 each) are merged using Reciprocal
+   Rank Fusion (RRF), which combines the rankings from both strategies into a single
+   list. This catches both conceptual matches and exact keyword matches.
 
-The top candidates go to **Cohere `/v2/rerank`** (`rerank-v4.0-pro`) as YAML documents rendered with
-`yaml.safe_dump(..., sort_keys=False)` (title → context → text → source_url); the returned `index`
-values are mapped back to the candidates and sorted by `relevance_score`. `colbert=false` / `rerank=false`
-switch stages off for comparison. Cohere calls use the shared **full-jitter retry**
-(`max_retries=5`, `base_delay=1.0s`, `max_delay=30s`, `Retry-After` honoured) for 429/5xx/transport errors,
-with the SDK's own retries disabled so the policy is authoritative.
+2. **Second pass — ColBERT reranking:** The top 50 results from the hybrid search are
+   re-scored using ColBERT's token-level matching (MaxSim). This is more precise than
+   either individual search strategy and pushes the most relevant results to the top.
 
-## 6 · Evaluation (RAGAS) and benchmark
+3. **Third pass — Cohere reranking:** The top 20 results go to Cohere's `rerank-v4.0-pro`
+   model, which reads the actual text of each chunk and scores how well it answers the
+   query. Results are formatted as YAML documents with title, context, text, and source
+   URL, giving the reranker full context for its judgment.
+
+You can turn off ColBERT (`colbert=false`) or Cohere reranking (`rerank=false`)
+individually to compare how each stage contributes to result quality.
+
+Cohere API calls use a retry strategy with randomized backoff (full jitter): if a
+request fails with a rate limit (429) or server error (5xx), it retries up to 5 times
+with increasing but randomized delays (1s base, 30s max), and respects Cohere's
+`Retry-After` header when present.
+
+## 6 · Quality evaluation (RAGAS) and benchmarks
 
 ```bash
-make eval        # python evaluation/run_ragas_eval.py --dataset ... --thresholds evaluation/thresholds.yaml
-make bench       # python benchmarks/colbert_latency_benchmark.py --seed --iterations 20
+make eval        # run the quality evaluation suite
+make bench       # run the ColBERT latency benchmark
 ```
 
-* `ragas==0.4.3` (pinned, with `langchain-community==0.3.31` because 0.4.x removed a module ragas imports).
-* Fixture `evaluation/fixtures/eval_dataset.json` → `SingleTurnSample(user_input, response,
-  retrieved_contexts, reference)` → `EvaluationDataset`.
-* `answer_relevancy` embeddings are configured explicitly: OpenAI `text-embedding-3-small` when
-  `OPENAI_API_KEY` is set, otherwise the FastEmbed `BAAI/bge-small-en-v1.5` adapter.
-* Judge LLM: Anthropic through `ragas.llms.llm_factory`. ragas 0.4 hard-codes `temperature`/`top_p`,
-  which Opus 5 / Sonnet 5 reject, so the default judge is `claude-haiku-4-5` (`RAGAS_JUDGE_MODEL`).
-* Thresholds (`evaluation/thresholds.yaml`): context_precision ≥ 0.70, context_recall ≥ 0.70,
-  faithfulness ≥ 0.80, answer_relevancy ≥ 0.75 — the CLI exits 1 below any of them and writes a JSON report.
-* The benchmark seeds `evaluation/fixtures/corpus.json` into a separate collection and reports p50/p95/mean
-  latency and recall@k for `rrf` vs `rrf+colbert`.
+The project includes an automated quality gate using the RAGAS evaluation framework.
+It tests the pipeline against a fixed set of questions and expected answers
+(`evaluation/fixtures/eval_dataset.json`) and scores four dimensions:
 
-## 7 · CI
+| Metric | What it measures | Minimum to pass |
+|---|---|---|
+| Context precision | Are the retrieved chunks actually relevant? | 0.70 |
+| Context recall | Did we find all the relevant chunks? | 0.70 |
+| Faithfulness | Does the answer stick to what the retrieved chunks say? | 0.80 |
+| Answer relevancy | Does the answer actually address the question asked? | 0.75 |
 
-`.github/workflows/ci.yml`: ruff lint + format, Python tests (no external services; fakeredis, mocked
-providers), sidecar tests, `docker compose config` + hadolint, a full-stack smoke test on `main`
-(`compose up --wait` then `/health` + `/ready` on every service), and a manually triggered RAGAS gate.
+If any score falls below its threshold, the evaluation exits with a failure code (useful
+in CI to block a merge). Results are also saved as a JSON report.
 
-Local equivalents: `make lint`, `make test`, `make test-node`, `make typecheck` (mypy clean), `make compose-check`.
+The evaluation uses `claude-haiku-4-5` as its judge model. For the answer-relevancy
+embeddings, it uses OpenAI's `text-embedding-3-small` if you've provided an
+`OPENAI_API_KEY`, otherwise it falls back to the local FastEmbed model.
 
-## Security model in one paragraph
+The **ColBERT benchmark** (`make bench`) seeds a test collection and measures search
+latency (p50, p95, mean) and recall, comparing hybrid search alone vs. hybrid + ColBERT
+reranking.
 
-Secrets only via `.env`; every internal hop authenticated with short-lived HS256 JWTs (`SERVICE_JWT_SECRET`
-≥ 32 chars enforced); per-caller Redis rate limits; TrustedHost + CORS allow-lists; `X-Content-Type-Options`,
-`Cache-Control: no-store`; payload size caps on every ingress; SSRF defence-in-depth in both Python and Node;
-Chromium never runs as root; n8n blocks env access from Code nodes and never receives provider keys;
-Qdrant and Redis require credentials even inside the compose network; host ports for data stores bind to
-`127.0.0.1` only.
+## 7 · CI (automated checks)
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push and pull
+request:
+
+1. **Code style** — ruff checks for lint issues and formatting
+2. **Python tests** — runs the full test suite without needing any external services
+   (Redis is faked, API providers are mocked)
+3. **Sidecar tests** — runs the Node.js sidecar's own test suite
+4. **Docker validation** — checks that `docker-compose.yml` is valid and Dockerfiles
+   pass hadolint (a Dockerfile linter)
+5. **Full stack smoke test** (main branch only) — spins up the entire Docker Compose
+   stack and hits every service's `/health` and `/ready` endpoints
+6. **RAGAS quality gate** (manually triggered) — runs the full evaluation suite against
+   real API endpoints
+
+Run any of these locally: `make lint`, `make test`, `make test-node`, `make typecheck`
+(mypy, fully passing), `make compose-check`.
+
+## Security
+
+- **No secrets in the repo.** All API keys, passwords, and tokens come from your `.env`
+  file, which is gitignored. `.env.example` shows every variable with safe placeholder
+  values.
+- **Every internal call is authenticated.** Services talk to each other using short-lived
+  signed tokens (JWT with HS256). The signing secret must be at least 32 characters.
+- **Rate limiting on every endpoint.** Each authenticated caller gets a fixed request
+  budget per time window, tracked in Redis.
+- **Request safety.** Trusted host and cross-origin allow-lists, `X-Content-Type-Options`
+  header (prevents browsers from guessing file types), `Cache-Control: no-store` (nothing
+  cached by intermediaries), and size limits on every input.
+- **SSRF protection in depth.** Both the Python extraction service and the Node.js browser
+  sidecar independently validate that outbound requests only go to public internet
+  addresses — private IPs, localhost, link-local, and other internal ranges are all blocked,
+  and DNS lookups are verified before connections are made.
+- **Chromium runs unprivileged.** The browser sidecar's Chromium process runs as a
+  non-root user.
+- **n8n is sandboxed.** Workflows can't read environment variables or access the host
+  filesystem, and n8n never receives any API keys for the AI providers.
+- **Databases require credentials even internally.** Qdrant and Redis both require
+  authentication, even though they're only accessible within the Docker network. Host
+  ports for data stores are bound to `127.0.0.1` only (not exposed to your network).
